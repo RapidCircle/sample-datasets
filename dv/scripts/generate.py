@@ -17,7 +17,7 @@ num_payments = 6000
 num_payment_methods = 5
 
 # Base path
-BASE_PATH = Path(__file__).parent / "data"
+BASE_PATH = Path(__file__).parent.parent / "data"
 BASE_PATH.mkdir(parents=True, exist_ok=True)
 
 # Seeds
