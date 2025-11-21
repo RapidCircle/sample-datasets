@@ -4,7 +4,7 @@ import numpy as np
 import json
 import random
 import string
-from datetime import date
+from datetime import date, timedelta
 from faker import Faker
 
 num_customers = 3000
@@ -16,10 +16,11 @@ num_users = 3500
 num_payments = 6000
 num_payment_methods = 5
 
-
+# Base path
 BASE_PATH = Path(__file__).parent / "data"
 BASE_PATH.mkdir(parents=True, exist_ok=True)
 
+# Seeds
 random.seed(42)
 np.random.seed(42)
 fake = Faker()
@@ -73,6 +74,147 @@ def inconsistent_id(base_id: str):
     return base_id
 
 
+# ---------------------------
+# CDC helper for ERP tables
+# ---------------------------
+def _mutate_row_for_table(row: pd.Series, table_name: str) -> pd.Series:
+    """
+    Apply a small 'business-meaningful' change per table
+    to simulate UPDATE events.
+    """
+    row = row.copy()
+    if table_name == "erp_customers":
+        # Change country or name
+        if random.random() < 0.5:
+            row["country"] = random_country()
+        else:
+            row["customer_name"] = random_customer_name()
+    elif table_name == "erp_customer_addresses":
+        # Change city/state/postal code
+        if random.random() < 0.33:
+            row["city"] = fake.city()
+        elif random.random() < 0.66:
+            row["state"] = fake.state()
+        else:
+            row["postal_code"] = fake.postcode()
+    elif table_name == "erp_products":
+        # Change price a bit or tweak name
+        if random.random() < 0.6:
+            old_price = float(row["price"])
+            factor = random.choice([0.9, 0.95, 1.05, 1.1])
+            row["price"] = round(old_price * factor, 2)
+        else:
+            row["product_name"] = row["product_name"] + " v2"
+    return row
+
+
+def generate_erp_cdc(
+    base_df: pd.DataFrame,
+    key_col: str,
+    table_name: str,
+    out_dir: Path,
+    start: date = date(2020, 1, 1),
+    end: date = date(2022, 12, 31),
+    p_update: float = 0.4,
+    p_delete: float = 0.15,
+) -> pd.DataFrame:
+    """
+    Generate a CDC stream for an ERP table based on a static snapshot.
+    Outputs a CSV named `<table_name>_cdc.csv` with:
+      - cdc_table
+      - cdc_op (I/U/D)
+      - cdc_ts
+      - cdc_seq (1,2,3...) per key
+      - all original columns
+
+    Only rows with non-null key_col are included.
+    """
+    records = []
+
+    # Only include rows with a business key
+    working_df = base_df[base_df[key_col].notna()].reset_index(drop=True)
+
+    for _, row in working_df.iterrows():
+        key_value = row[key_col]
+
+        # Base INSERT event
+        # Use created_at if present; else random in range
+        if "created_at" in row.index and pd.notna(row["created_at"]):
+            try:
+                base_ts = pd.to_datetime(row["created_at"]).date()
+            except Exception:
+                base_ts = fake.date_between(start_date=start, end_date=end)
+        else:
+            base_ts = fake.date_between(start_date=start, end_date=end)
+
+        cdc_seq = 1
+        insert_event = {
+            "cdc_table": table_name,
+            "cdc_op": "I",
+            "cdc_ts": base_ts.isoformat(),
+            "cdc_seq": cdc_seq,
+        }
+        insert_event.update(row.to_dict())
+        records.append(insert_event)
+
+        current_ts = base_ts
+
+        # Optional UPDATE event
+        if random.random() < p_update:
+            cdc_seq += 1
+            # ensure ts moves forward
+            delta_days = random.randint(1, 365)
+            upd_ts = current_ts + timedelta(days=delta_days)
+            if upd_ts > end:
+                upd_ts = end
+
+            updated_row = _mutate_row_for_table(row, table_name)
+
+            update_event = {
+                "cdc_table": table_name,
+                "cdc_op": "U",
+                "cdc_ts": upd_ts.isoformat(),
+                "cdc_seq": cdc_seq,
+            }
+            update_event.update(updated_row.to_dict())
+            records.append(update_event)
+            current_ts = upd_ts
+            row = updated_row  # latest state
+
+        # Optional DELETE event
+        if random.random() < p_delete:
+            cdc_seq += 1
+            delta_days = random.randint(1, 365)
+            del_ts = current_ts + timedelta(days=delta_days)
+            if del_ts > end:
+                del_ts = end
+
+            delete_event = {
+                "cdc_table": table_name,
+                "cdc_op": "D",
+                "cdc_ts": del_ts.isoformat(),
+                "cdc_seq": cdc_seq,
+            }
+            delete_event.update(row.to_dict())
+            records.append(delete_event)
+
+    cdc_df = pd.DataFrame(records)
+
+    # Order by key + timestamp + seq
+    cdc_df.sort_values(
+        by=[key_col, "cdc_ts", "cdc_seq"],
+        inplace=True,
+        ignore_index=True,
+    )
+
+    out_path = out_dir / f"{table_name}_cdc.csv"
+    cdc_df.to_csv(out_path, index=False)
+    return cdc_df
+
+
+# ---------------------------
+# ERP data (snapshots + CDC)
+# ---------------------------
 def generate_erp_data(
     num_customers: int,
     num_addresses: int,
@@ -81,22 +223,24 @@ def generate_erp_data(
 ):
     """
     Generate sample ERP data:
-    - erp_customers.csv
-    - erp_customer_addresses.csv
-    - erp_products.csv
+    - erp_customers.csv (+ erp_customers_cdc.csv)
+    - erp_customer_addresses.csv (+ erp_customer_addresses_cdc.csv)
+    - erp_products.csv (+ erp_products_cdc.csv)
     """
-    
+
+    # --- Customers snapshot ---
     erp_customers = []
     for _ in range(num_customers):
         raw_id = random_string("CUST")
+        # ~2.5% missing IDs
         cust_id = inconsistent_id(raw_id) if random.random() > 0.025 else None
 
         name = random_customer_name()
         country = introduce_null(random_country(), prob=0.05)
         created_at = fake.date_between(
-                        start_date=date(2020, 1, 1),
-                        end_date=date(2022, 12, 31)
-                    )
+            start_date=date(2020, 1, 1),
+            end_date=date(2022, 12, 31),
+        )
 
         erp_customers.append(
             [
@@ -113,6 +257,7 @@ def generate_erp_data(
     )
     erp_customers_df.to_csv(out_dir / "erp_customers.csv", index=False)
 
+    # --- Addresses snapshot ---
     erp_addresses = []
     customer_ids = erp_customers_df["customer_id"].dropna().tolist()
     for _ in range(num_addresses):
@@ -121,9 +266,7 @@ def generate_erp_data(
         city = fake.city()
         postal_code = fake.postcode()
         state = fake.state()
-        erp_addresses.append(
-            [cust_id, address, city, state, postal_code]
-        )
+        erp_addresses.append([cust_id, address, city, state, postal_code])
 
     erp_addresses_df = pd.DataFrame(
         erp_addresses,
@@ -131,6 +274,7 @@ def generate_erp_data(
     )
     erp_addresses_df.to_csv(out_dir / "erp_customer_addresses.csv", index=False)
 
+    # --- Products snapshot ---
     erp_products = []
     for _ in range(num_products):
         product_id = random_string("PROD")
@@ -153,9 +297,46 @@ def generate_erp_data(
     )
     erp_products_df.to_csv(out_dir / "erp_products.csv", index=False)
 
-    return erp_customers_df, erp_products_df
+    # --- CDC generation for ERP tables ---
+    customers_cdc_df = generate_erp_cdc(
+        erp_customers_df,
+        key_col="customer_id",
+        table_name="erp_customers",
+        out_dir=out_dir,
+        start=date(2020, 1, 1),
+        end=date(2024, 12, 31),
+    )
+
+    addresses_cdc_df = generate_erp_cdc(
+        erp_addresses_df,
+        key_col="customer_id",
+        table_name="erp_customer_addresses",
+        out_dir=out_dir,
+        start=date(2020, 1, 1),
+        end=date(2024, 12, 31),
+    )
+
+    products_cdc_df = generate_erp_cdc(
+        erp_products_df,
+        key_col="product_id",
+        table_name="erp_products",
+        out_dir=out_dir,
+        start=date(2020, 1, 1),
+        end=date(2024, 12, 31),
+    )
+
+    return (
+        erp_customers_df,
+        erp_products_df,
+        customers_cdc_df,
+        addresses_cdc_df,
+        products_cdc_df,
+    )
 
 
+# ---------------------------
+# SaaS + Payments (unchanged)
+# ---------------------------
 def generate_saas_data(
     num_orders: int,
     num_order_items: int,
@@ -170,7 +351,6 @@ def generate_saas_data(
     - saas_orders.json
     - saas_order_items.csv
     """
-   
     saas_users = []
     for _ in range(num_users):
         user_id = random_string("USER")
@@ -189,14 +369,11 @@ def generate_saas_data(
 
     for _ in range(num_orders):
         order_id = random_string("ORD")
-       
-        customer_ref = random.choice(
-            customer_ids + [random_string("CUST")]
-        )
+        customer_ref = random.choice(customer_ids + [random_string("CUST")])
         order_date = fake.date_between(
-                        start_date=date(2020, 1, 1),
-                        end_date=date(2022, 12, 31)
-                    )
+            start_date=date(2020, 1, 1),
+            end_date=date(2022, 12, 31),
+        )
 
         amount = introduce_null(
             round(random.uniform(100, 5000), 2),
@@ -270,9 +447,9 @@ def generate_payments_data(
             order_ref = None
 
         payment_date = fake.date_between(
-                            start_date=date(2020, 1, 1),
-                            end_date=date(2022, 12, 31)
-                        )
+            start_date=date(2020, 1, 1),
+            end_date=date(2022, 12, 31),
+        )
         payment_amount = round(random.uniform(50, 5000), 2)
         payment_method = random.choice(payment_methods)
 
@@ -302,7 +479,13 @@ def generate_payments_data(
 
 
 if __name__ == "__main__":
-    erp_customers_df, erp_products_df = generate_erp_data(
+    (
+        erp_customers_df,
+        erp_products_df,
+        customers_cdc_df,
+        addresses_cdc_df,
+        products_cdc_df,
+    ) = generate_erp_data(
         num_customers=num_customers,
         num_addresses=num_addresses,
         num_products=num_products,
@@ -324,4 +507,4 @@ if __name__ == "__main__":
         out_dir=BASE_PATH,
     )
 
-    print(f"Data generated under: {BASE_PATH.resolve()}")
+    print(f"Data (snapshots + CDC) generated under: {BASE_PATH.resolve()}")
