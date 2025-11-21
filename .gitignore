@@ -1,0 +1,24 @@
+# Byte-code files
+*.pyc
+__pycache__/
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# IDE/Editor specific files
+.idea/
+.vscode/
+
+# Test/build related
+.pytest_cache/
+build/
+dist/
+
+# Log files
+*.log
+
+# Sensitive information
+*.env
